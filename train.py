@@ -55,6 +55,7 @@ def main():
     parser.add_argument('--log_name', default='vit')
     parser.add_argument('--tensorboard_dir', default='./tb_logs')
     parser.add_argument('--ckpt_dir', default='./ckpt')
+    parser.add_argument('--clip_grad', type=float, default=0.0)
     parser.add_argument('--use_tensorboard',
                         default=None, action='store_true')
     parser.add_argument('--save_checkpoint',
@@ -153,6 +154,10 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
 
+    scaler = None
+    if args.amp:
+        scaler = amp.GradScaler()
+
     # resume from checkpoint
     last_epoch, best_metric = -1, None
     if os.path.exists(latest_pth_path):
@@ -208,7 +213,8 @@ def main():
               sampler=samplers['train'], criterion=criterion,
               optimizer=optimizer, scheduler=scheduler,
               schedule_lr_per_epoch=False,
-              writer=writer, show_progress=dist.get_rank() == 0, dali=args.dali)
+              writer=writer, show_progress=dist.get_rank() == 0, dali=args.dali,
+              use_amp=args.amp, scaler=scaler, clip_grad=args.clip_grad)
 
         meters = dict()
         for split, loader in loaders.items():
@@ -250,7 +256,7 @@ def main():
 
 
 def train(model, loader, epoch, sampler, criterion, optimizer,
-          scheduler, schedule_lr_per_epoch, writer=None, show_progress=True, dali=False):
+          scheduler, schedule_lr_per_epoch, writer=None, show_progress=True, dali=False, use_amp=False, scaler=None, clip_grad=0.0):
     if sampler:
         sampler.set_epoch(epoch)
     model.train()
@@ -261,10 +267,21 @@ def train(model, loader, epoch, sampler, criterion, optimizer,
             targets = targets.cuda()
         optimizer.zero_grad()
 
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
+        with amp.autocast(enabled=use_amp):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            loss.backward()
+        if clip_grad > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        if scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         # write train loss log
         dist.all_reduce(loss)
