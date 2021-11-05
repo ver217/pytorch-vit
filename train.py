@@ -4,43 +4,51 @@ import os
 import random
 import shutil
 from datetime import datetime
+
 from config import configs
 
 import numpy as np
-import horovod.torch as hvd
+import torch.distributed as dist
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.multiprocessing as mp
+import torch.optim as optim
 from torchvision import models
 from tqdm import tqdm
-
+from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset import ImageNetFolder, make_meters, DaliImageNet
-from optim.lamb import create_lamb_optimizer
 from optim import lr_scheduler
-from loss import LabelSmoothLoss
+from timm.models import vit_small_patch16_224
 
 METRIC = 'acc/test_top1'
 
 
+def setup(rank, world_size):
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    # initialize the process group
+    dist.init_process_group('nccl', rank=rank, world_size=world_size)
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--device', default='cuda')
     parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--suffix', default='')
     parser.add_argument('--seed', type=int)
     parser.add_argument('--num_epochs', type=int)
-    parser.add_argument('--total_batch_size', type=int)
     parser.add_argument('--batch_size', type=int)
+    parser.add_argument('--num_batches_per_step', type=int, default=1)
     parser.add_argument('--dataset_path')
     parser.add_argument('--num_workers', type=int)
     parser.add_argument('--num_threads', type=int)
-    parser.add_argument('--base_lr', type=float)
-    parser.add_argument('--lr_scaling')
+    parser.add_argument('--lr', type=float)
     parser.add_argument('--weight_decay', type=float)
     parser.add_argument('--warmup_epochs', type=float)
-    parser.add_argument('--bias_correction',
-                        default=None, action='store_true')
     parser.add_argument('--save_checkpoint',
                         default=None, action='store_true')
     parser.add_argument('--dali',
@@ -56,35 +64,23 @@ def main():
     for k, v in vars(args).items():
         printr(f'[{k}] = {v}')
 
-    if args.device is not None and args.device != 'cpu':
-        # Horovod: pin GPU to local rank.
-        torch.cuda.set_device(hvd.local_rank())
-        cudnn.benchmark = True
-
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if args.device == 'cuda':
-        cudnn.deterministic = True
-        cudnn.benchmark = False
+    cudnn.deterministic = True
+    cudnn.benchmark = False
 
-    num_batches_per_step = args.total_batch_size // (
-        args.batch_size * hvd.size())
-    if num_batches_per_step * args.batch_size * hvd.size() != args.total_batch_size:
-        raise ValueError(
-            f'total_batch_size({args.total_batch_size}) is not integer multiples of batch_size({args.batch_size}) * GPUs({hvd.size()})')
-
-    save_path = f'runs/lamb-{args.total_batch_size}{args.suffix}.np{hvd.size()}'
+    save_path = f'runs/vit-{args.suffix}.np{dist.get_world_size()}'
     printr(f'[save_path] = {save_path}')
     checkpoint_path = os.path.join(save_path, 'checkpoints')
     checkpoint_path_fmt = os.path.join(
-        checkpoint_path, f'e{"{epoch}"}-r{hvd.rank()}.pth'
+        checkpoint_path, f'e{"{epoch}"}-r{dist.get_rank()}.pth'
     )
     latest_pth_path = os.path.join(
-        checkpoint_path, f'latest-r{hvd.rank()}.pth'
+        checkpoint_path, f'latest-r{dist.get_rank()}.pth'
     )
     best_pth_path = os.path.join(
-        checkpoint_path, f'best-r{hvd.rank()}.pth'
+        checkpoint_path, f'best-r{dist.get_rank()}.pth'
     )
     os.makedirs(checkpoint_path, exist_ok=True)
 
@@ -99,9 +95,9 @@ def main():
     if args.dali:
         dataset = DaliImageNet(args.dataset_path,
                                batch_size=args.batch_size,
-                               train_batch_size=args.batch_size * num_batches_per_step,
-                               shard_id=hvd.rank(),
-                               num_shards=hvd.size(),
+                               train_batch_size=args.batch_size,
+                               shard_id=dist.get_rank(),
+                               num_shards=dist.get_world_size(),
                                num_workers=args.num_workers)
     else:
         dataset = ImageNetFolder(args.dataset_path)
@@ -123,41 +119,26 @@ def main():
     else:
         samplers, loaders = {}, {}
         for split in dataset:
-            # Horovod: use DistributedSampler to partition data among workers.
-            # Manually specify `num_replicas=hvd.size()` and `rank=hvd.rank()`.
             samplers[split] = torch.utils.data.distributed.DistributedSampler(
-                dataset[split], num_replicas=hvd.size(), rank=hvd.rank())
+                dataset[split], num_replicas=dist.get_world_size(), rank=dist.get_rank())
             loaders[split] = torch.utils.data.DataLoader(
-                dataset[split], batch_size=args.batch_size * (
-                    num_batches_per_step if split == 'train' else 1),
+                dataset[split], batch_size=args.batch_size,
                 sampler=samplers[split],
-                drop_last=(num_batches_per_step > 1
+                drop_last=(args.num_batches_per_step > 1
                            and split == 'train'),
                 **loader_kwargs
             )
 
-    printr(f'\n==> creating model "resnet50"')
-    model = models.resnet50()
-    model = model.to(args.device)
+    printr(f'\n==> creating model {vit_small_patch16_224}')
+    model = vit_small_patch16_224().cuda()
+    model = DDP(model, device_ids=[dist.get_rank()])
 
-    criterion = LabelSmoothLoss(smoothing=0.1).to(args.device)
+    criterion = nn.CrossEntropyLoss()
     # Horovod: scale learning rate by the number of GPUs.
-    lr = args.base_lr
-    if args.lr_scaling == 'sqrt':
-        lr *= math.sqrt(num_batches_per_step * hvd.size())
-    elif args.lr_scaling == 'linear':
-        lr *= num_batches_per_step * hvd.size()
-    printr(f'\n==> creating optimizer LAMB with LR = {lr}')
 
-    optimizer = create_lamb_optimizer(
-        model, lr, weight_decay=args.weight_decay, bias_correction=args.bias_correction)
+    printr(f'\n==> creating optimizer Adam with LR = {args.lr}')
 
-    # Horovod: wrap optimizer with DistributedOptimizer.
-    optimizer = hvd.DistributedOptimizer(
-        optimizer, named_parameters=model.named_parameters(),
-        backward_passes_per_step=num_batches_per_step,
-        op=hvd.Average
-    )
+    optimizer = optim.AdamW(model, lr=args.lr, weight_decay=args.weight_decay)
 
     # resume from checkpoint
     last_epoch, best_metric = -1, None
@@ -171,14 +152,8 @@ def main():
         last_epoch = checkpoint.get('epoch', last_epoch)
         best_metric = checkpoint.get('meters', {}).get(
             f'{METRIC}_best', best_metric)
-        # Horovod: broadcast parameters.
-        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
     else:
         printr('\n==> train from scratch')
-        # Horovod: broadcast parameters & optimizer state.
-        printr('\n==> broadcasting paramters and optimizer state')
-        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-        hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     num_steps_per_epoch = len(loaders['train'])
     warmup_lr_epochs = getattr(args, 'warmup_epochs', 0)
@@ -190,8 +165,8 @@ def main():
     if warmup_lr_epochs > 0:
         warmup_steps *= num_steps_per_epoch
 
-    scheduler = lr_scheduler.PolynomialWarmup(
-        optimizer, decay_steps, warmup_steps, end_lr=0.0, power=1.0, last_epoch=last)
+    scheduler = lr_scheduler.CosineAnnealingWarmup(
+        optimizer, decay_steps, warmup_steps, last_epoch=last)
 
     ############
     # Training #
@@ -205,7 +180,7 @@ def main():
     if args.evaluate or last_epoch >= args.num_epochs:
         return
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         from torch.utils.tensorboard import SummaryWriter
         timestamp = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
         tensorboard_path = os.path.join(save_path, timestamp)
@@ -217,23 +192,22 @@ def main():
         printr(f'\n==> training epoch {current_epoch + 1}/{args.num_epochs}')
 
         train(model=model, loader=loaders['train'],
-              device=args.device, epoch=current_epoch,
+              epoch=current_epoch,
               sampler=samplers['train'], criterion=criterion,
               optimizer=optimizer, scheduler=scheduler,
               batch_size=args.batch_size,
-              num_batches_per_step=num_batches_per_step,
+              num_batches_per_step=args.num_batches_per_step,
               num_steps_per_epoch=num_steps_per_epoch,
               warmup_lr_epochs=warmup_lr_epochs,
               schedule_lr_per_epoch=False,
-              writer=writer, quiet=hvd.rank() != 0, dali=args.dali)
+              writer=writer, quiet=dist.get_rank() != 0, dali=args.dali)
 
         meters = dict()
         for split, loader in loaders.items():
             if split != 'train':
                 meters.update(evaluate(model, loader=loader,
-                                       device=args.device,
                                        meters=training_meters,
-                                       split=split, quiet=hvd.rank() != 0, dali=args.dali))
+                                       split=split, quiet=dist.get_rank() != 0, dali=args.dali))
 
         best = False
         if best_metric is None or best_metric < meters[METRIC]:
@@ -242,8 +216,8 @@ def main():
 
         if writer is not None:
             num_inputs = ((current_epoch + 1) * num_steps_per_epoch
-                          * num_batches_per_step
-                          * args.batch_size * hvd.size())
+                          * args.num_batches_per_step
+                          * args.batch_size * dist.get_rank())
             print('')
             for k, meter in meters.items():
                 print(f'[{k}] = {meter:.2f}')
@@ -272,9 +246,6 @@ def main():
 
 def train(model, loader, device, epoch, sampler, criterion, optimizer,
           scheduler, batch_size, num_batches_per_step, num_steps_per_epoch, warmup_lr_epochs, schedule_lr_per_epoch, writer=None, quiet=True, dali=False):
-    step_size = num_batches_per_step * batch_size
-    num_inputs = epoch * num_steps_per_epoch * step_size * hvd.size()
-    _r_num_batches_per_step = 1.0 / num_batches_per_step
 
     if sampler:
         sampler.set_epoch(epoch)
@@ -289,24 +260,17 @@ def train(model, loader, device, epoch, sampler, criterion, optimizer,
             targets = targets.to(device, non_blocking=True)
         optimizer.zero_grad()
 
-        loss = torch.tensor([0.0])
-        for b in range(0, step_size, batch_size):
-            _inputs = inputs[b:b+batch_size]
-            _targets = targets[b:b+batch_size]
-            _outputs = model(_inputs)
-            _loss = criterion(_outputs, _targets)
-            _loss.mul_(_r_num_batches_per_step)
-            _loss.backward()
-            loss += _loss.item()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
         optimizer.step()
 
         # write train loss log
-        loss = hvd.allreduce(loss, name='loss').item()
+        loss = dist.all_reduce(loss).div_(dist.get_world_size()).item()
         if writer is not None:
-            num_inputs += step_size * hvd.size()
-            writer.add_scalar('loss/train', loss, num_inputs)
+            writer.add_scalar('loss/train', loss, step)
             lr = optimizer.param_groups[0]['lr']
-            writer.add_scalar('lr/train', lr, num_inputs)
+            writer.add_scalar('lr/train', lr, step)
 
         adjust_learning_rate(scheduler, epoch=epoch, step=step,
                              schedule_lr_per_epoch=schedule_lr_per_epoch)
@@ -338,7 +302,7 @@ def evaluate(model, loader, device, meters, split='test', quiet=True, dali=False
         data = meter.data()
         for dk, d in data.items():
             data[dk] = \
-                hvd.allreduce(torch.tensor([d]), name=dk, op=hvd.Sum).item()
+                dist.all_reduce(torch.tensor([d])).item()
         meter.set(data)
         meters[k] = meter.compute()
     return meters
@@ -353,10 +317,11 @@ def adjust_learning_rate(scheduler, epoch, step,
 
 
 def printr(*args, **kwargs):
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         print(*args, **kwargs)
 
 
 if __name__ == '__main__':
-    hvd.init()
+    setup()
     main()
+    cleanup()
