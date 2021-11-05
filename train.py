@@ -20,15 +20,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset import ImageNetFolder, make_meters, DaliImageNet
 from optim import lr_scheduler
 from timm.models import vit_small_patch16_224
+from torch.cuda import amp
 
 METRIC = 'acc/test_top1'
 
 
-def setup(rank, world_size):
+def setup():
     rank = int(os.environ['RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     # initialize the process group
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 
 def cleanup():
@@ -49,9 +51,15 @@ def main():
     parser.add_argument('--lr', type=float)
     parser.add_argument('--weight_decay', type=float)
     parser.add_argument('--warmup_epochs', type=float)
+    parser.add_argument('--tensorboard_dir')
+    parser.add_argument('--ckpt_dir')
     parser.add_argument('--save_checkpoint',
                         default=None, action='store_true')
     parser.add_argument('--dali',
+                        default=None, action='store_true')
+    parser.add_argument('--gpu_aug',
+                        default=None, action='store_true')
+    parser.add_argument('--amp',
                         default=None, action='store_true')
     args = parser.parse_args()
 
@@ -69,6 +77,7 @@ def main():
     torch.manual_seed(args.seed)
     cudnn.deterministic = True
     cudnn.benchmark = False
+    torch.set_num_threads(args.num_threads)
 
     save_path = f'runs/vit-{args.suffix}.np{dist.get_world_size()}'
     printr(f'[save_path] = {save_path}')
@@ -95,15 +104,14 @@ def main():
     if args.dali:
         dataset = DaliImageNet(args.dataset_path,
                                batch_size=args.batch_size,
-                               train_batch_size=args.batch_size,
                                shard_id=dist.get_rank(),
                                num_shards=dist.get_world_size(),
-                               num_workers=args.num_workers)
+                               gpu_aug=args.gpu_aug)
     else:
         dataset = ImageNetFolder(args.dataset_path)
         # Horovod: limit # of CPU threads to be used per worker.
         loader_kwargs = {'num_workers': args.num_workers,
-                         'pin_memory': True} if args.device == 'cuda' else {}
+                         'pin_memory': True}
         # When supported, use 'forkserver' to spawn dataloader workers
         # instead of 'fork' to prevent issues with Infiniband implementations
         # that are not fork-safe
@@ -113,7 +121,7 @@ def main():
                 'forkserver' in mp.get_all_start_methods()):
             loader_kwargs['multiprocessing_context'] = 'forkserver'
         printr(f'\n==> loading dataset "{loader_kwargs}""')
-    torch.set_num_threads(args.num_threads)
+
     if args.dali:
         samplers, loaders = {split: None for split in dataset}, dataset
     else:
@@ -138,7 +146,8 @@ def main():
 
     printr(f'\n==> creating optimizer Adam with LR = {args.lr}')
 
-    optimizer = optim.AdamW(model, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
+                            weight_decay=args.weight_decay)
 
     # resume from checkpoint
     last_epoch, best_metric = -1, None
@@ -173,17 +182,17 @@ def main():
     ############
 
     training_meters = make_meters()
-    meters = evaluate(model, device=args.device, meters=training_meters,
+    meters = evaluate(model, meters=training_meters,
                       loader=loaders['test'], split='test', dali=args.dali)
     for k, meter in meters.items():
         printr(f'[{k}] = {meter:.2f}')
     if args.evaluate or last_epoch >= args.num_epochs:
         return
 
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and args.tensorboard_dir:
         from torch.utils.tensorboard import SummaryWriter
         timestamp = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
-        tensorboard_path = os.path.join(save_path, timestamp)
+        tensorboard_path = os.path.join(args.tensorboard_dir, timestamp)
         writer = SummaryWriter(tensorboard_path)
     else:
         writer = None
@@ -214,13 +223,13 @@ def main():
             best_metric, best = meters[METRIC], True
         meters[f'{METRIC}_best'] = best_metric
 
-        if writer is not None:
-            num_inputs = ((current_epoch + 1) * num_steps_per_epoch
-                          * args.num_batches_per_step
-                          * args.batch_size * dist.get_rank())
-            print('')
-            for k, meter in meters.items():
-                print(f'[{k}] = {meter:.2f}')
+        num_inputs = ((current_epoch + 1) * num_steps_per_epoch
+                      * args.num_batches_per_step
+                      * args.batch_size * dist.get_rank())
+        printr('')
+        for k, meter in meters.items():
+            printr(f'[{k}] = {meter:.2f}')
+            if writer is not None:
                 writer.add_scalar(k, meter, num_inputs)
 
         checkpoint = {
@@ -244,20 +253,17 @@ def main():
             printr(f'[save_path] = {checkpoint_path}')
 
 
-def train(model, loader, device, epoch, sampler, criterion, optimizer,
+def train(model, loader, epoch, sampler, criterion, optimizer,
           scheduler, batch_size, num_batches_per_step, num_steps_per_epoch, warmup_lr_epochs, schedule_lr_per_epoch, writer=None, quiet=True, dali=False):
 
     if sampler:
         sampler.set_epoch(epoch)
     model.train()
-    for step, data in enumerate(tqdm(
+    for step, (inputs, targets) in enumerate(tqdm(
             loader, desc='train', ncols=0, disable=quiet)):
-        if dali:
-            inputs, targets = data[0]['data'], data[0]['label']
-        else:
-            inputs, targets = data
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+        if not dali:
+            inputs = inputs.cuda()
+            targets = targets.cuda()
         optimizer.zero_grad()
 
         outputs = model(inputs)
@@ -266,7 +272,8 @@ def train(model, loader, device, epoch, sampler, criterion, optimizer,
         optimizer.step()
 
         # write train loss log
-        loss = dist.all_reduce(loss).div_(dist.get_world_size()).item()
+        dist.all_reduce(loss)
+        loss = (loss / dist.get_world_size()).item()
         if writer is not None:
             writer.add_scalar('loss/train', loss, step)
             lr = optimizer.param_groups[0]['lr']
@@ -276,7 +283,7 @@ def train(model, loader, device, epoch, sampler, criterion, optimizer,
                              schedule_lr_per_epoch=schedule_lr_per_epoch)
 
 
-def evaluate(model, loader, device, meters, split='test', quiet=True, dali=False):
+def evaluate(model, loader, meters, split='test', quiet=True, dali=False):
     _meters = {}
     for k, meter in meters.items():
         meter.reset()
@@ -286,23 +293,22 @@ def evaluate(model, loader, device, meters, split='test', quiet=True, dali=False
     model.eval()
 
     with torch.no_grad():
-        for data in tqdm(loader, desc=split, ncols=0, disable=quiet):
-            if dali:
-                inputs, targets = data[0]['data'], data[0]['label']
-            else:
-                inputs, targets = data
-                inputs = inputs.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
+        for inputs, targets in tqdm(loader, desc=split, ncols=0, disable=quiet):
+            if not dali:
+                inputs = inputs.cuda()
+                targets = targets.cuda()
 
             outputs = model(inputs)
             for meter in meters.values():
                 meter.update(outputs, targets)
 
+    buffer = torch.zeros(1, device=dist.get_rank())
     for k, meter in meters.items():
         data = meter.data()
         for dk, d in data.items():
-            data[dk] = \
-                dist.all_reduce(torch.tensor([d])).item()
+            buffer.fill_(d)
+            dist.all_reduce(buffer)
+            data[dk] = buffer.item()
         meter.set(data)
         meters[k] = meter.compute()
     return meters
