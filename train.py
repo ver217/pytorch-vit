@@ -204,19 +204,15 @@ def main():
               epoch=current_epoch,
               sampler=samplers['train'], criterion=criterion,
               optimizer=optimizer, scheduler=scheduler,
-              batch_size=args.batch_size,
-              num_batches_per_step=args.num_batches_per_step,
-              num_steps_per_epoch=num_steps_per_epoch,
-              warmup_lr_epochs=warmup_lr_epochs,
               schedule_lr_per_epoch=False,
-              writer=writer, quiet=dist.get_rank() != 0, dali=args.dali)
+              writer=writer, show_progress=dist.get_rank() == 0, dali=args.dali)
 
         meters = dict()
         for split, loader in loaders.items():
             if split != 'train':
                 meters.update(evaluate(model, loader=loader,
                                        meters=training_meters,
-                                       split=split, quiet=dist.get_rank() != 0, dali=args.dali))
+                                       split=split, show_progress=dist.get_rank() == 0, dali=args.dali))
 
         best = False
         if best_metric is None or best_metric < meters[METRIC]:
@@ -254,13 +250,13 @@ def main():
 
 
 def train(model, loader, epoch, sampler, criterion, optimizer,
-          scheduler, batch_size, num_batches_per_step, num_steps_per_epoch, warmup_lr_epochs, schedule_lr_per_epoch, writer=None, quiet=True, dali=False):
+          scheduler, schedule_lr_per_epoch, writer=None, show_progress=True, dali=False):
 
     if sampler:
         sampler.set_epoch(epoch)
     model.train()
     for step, (inputs, targets) in enumerate(tqdm(
-            loader, desc='train', ncols=0, disable=quiet)):
+            loader, desc='train', ncols=0, disable=not show_progress)):
         if not dali:
             inputs = inputs.cuda()
             targets = targets.cuda()
@@ -283,7 +279,7 @@ def train(model, loader, epoch, sampler, criterion, optimizer,
                              schedule_lr_per_epoch=schedule_lr_per_epoch)
 
 
-def evaluate(model, loader, meters, split='test', quiet=True, dali=False):
+def evaluate(model, loader, meters, split='test', show_progress=False, dali=False):
     _meters = {}
     for k, meter in meters.items():
         meter.reset()
@@ -293,7 +289,7 @@ def evaluate(model, loader, meters, split='test', quiet=True, dali=False):
     model.eval()
 
     with torch.no_grad():
-        for inputs, targets in tqdm(loader, desc=split, ncols=0, disable=quiet):
+        for inputs, targets in tqdm(loader, desc=split, ncols=0, disable=not show_progress):
             if not dali:
                 inputs = inputs.cuda()
                 targets = targets.cuda()
