@@ -5,6 +5,8 @@ import random
 import shutil
 from datetime import datetime
 
+from torch.serialization import load
+
 from config import configs
 
 import numpy as np
@@ -40,7 +42,6 @@ def cleanup():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--evaluate', action='store_true')
-    parser.add_argument('--suffix', default='')
     parser.add_argument('--seed', type=int)
     parser.add_argument('--num_epochs', type=int)
     parser.add_argument('--batch_size', type=int)
@@ -51,8 +52,11 @@ def main():
     parser.add_argument('--lr', type=float)
     parser.add_argument('--weight_decay', type=float)
     parser.add_argument('--warmup_epochs', type=float)
-    parser.add_argument('--tensorboard_dir')
-    parser.add_argument('--ckpt_dir')
+    parser.add_argument('--log_name', default='vit')
+    parser.add_argument('--tensorboard_dir', default='./tb_logs')
+    parser.add_argument('--ckpt_dir', default='./ckpt')
+    parser.add_argument('--use_tensorboard',
+                        default=None, action='store_true')
     parser.add_argument('--save_checkpoint',
                         default=None, action='store_true')
     parser.add_argument('--dali',
@@ -79,7 +83,7 @@ def main():
     cudnn.benchmark = False
     torch.set_num_threads(args.num_threads)
 
-    save_path = f'runs/vit-{args.suffix}.np{dist.get_world_size()}'
+    save_path = os.path.join(args.ckpt_dir, args.log_name)
     printr(f'[save_path] = {save_path}')
     checkpoint_path = os.path.join(save_path, 'checkpoints')
     checkpoint_path_fmt = os.path.join(
@@ -189,10 +193,9 @@ def main():
     if args.evaluate or last_epoch >= args.num_epochs:
         return
 
-    if dist.get_rank() == 0 and args.tensorboard_dir:
+    if dist.get_rank() == 0 and args.use_tensorboard:
         from torch.utils.tensorboard import SummaryWriter
-        timestamp = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
-        tensorboard_path = os.path.join(args.tensorboard_dir, timestamp)
+        tensorboard_path = os.path.join(args.tensorboard_dir, args.log_name)
         writer = SummaryWriter(tensorboard_path)
     else:
         writer = None
@@ -219,14 +222,11 @@ def main():
             best_metric, best = meters[METRIC], True
         meters[f'{METRIC}_best'] = best_metric
 
-        num_inputs = ((current_epoch + 1) * num_steps_per_epoch
-                      * args.num_batches_per_step
-                      * args.batch_size * dist.get_rank())
         printr('')
         for k, meter in meters.items():
             printr(f'[{k}] = {meter:.2f}')
             if writer is not None:
-                writer.add_scalar(k, meter, num_inputs)
+                writer.add_scalar(k, meter, current_epoch)
 
         checkpoint = {
             'epoch': current_epoch,
@@ -251,7 +251,6 @@ def main():
 
 def train(model, loader, epoch, sampler, criterion, optimizer,
           scheduler, schedule_lr_per_epoch, writer=None, show_progress=True, dali=False):
-
     if sampler:
         sampler.set_epoch(epoch)
     model.train()
@@ -271,9 +270,10 @@ def train(model, loader, epoch, sampler, criterion, optimizer,
         dist.all_reduce(loss)
         loss = (loss / dist.get_world_size()).item()
         if writer is not None:
-            writer.add_scalar('loss/train', loss, step)
+            global_step = step + epoch * len(loader)
+            writer.add_scalar('loss/train', loss, global_step)
             lr = optimizer.param_groups[0]['lr']
-            writer.add_scalar('lr/train', lr, step)
+            writer.add_scalar('lr/train', lr, global_step)
 
         adjust_learning_rate(scheduler, epoch=epoch, step=step,
                              schedule_lr_per_epoch=schedule_lr_per_epoch)
