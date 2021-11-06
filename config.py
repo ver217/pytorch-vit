@@ -11,6 +11,7 @@ config = Config({
         'num_epochs': 300,
         'num_batches_per_step': 4,
         'log_name': 'vit-s16',
+        'log_dir': '/mnt/shared/vit/logs',
         'tensorboard_dir': '/mnt/shared/vit/tb_logs',
         'ckpt_dir': '/mnt/shared/vit/ckpt',
         'clip_grad': 1.0,

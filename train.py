@@ -16,6 +16,7 @@ from tqdm import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset import ImageNetFolder, make_meters, DaliImageNet
 from torch.cuda import amp
+from logger import DistributedLogger
 
 METRIC = 'acc/test_top1'
 
@@ -37,11 +38,15 @@ def main():
     parser.add_argument('--evaluate', action='store_true')
     args = parser.parse_args()
 
+    # Init logger
+    logger = DistributedLogger(
+        config.train.log_name, log_dir=config.train.log_dir)
+
     # Print config
     for k, v in config.items():
-        printr(f'\n[{k}]')
+        logger.info(f'\n[{k}]')
         for name, val in v.items():
-            printr(f'{name} = {val}')
+            logger.info(f'{name} = {val}')
 
     # Set seed
     random.seed(config.train.seed)
@@ -69,7 +74,7 @@ def main():
         latest_pth_path = best_pth_path
 
     # Build dataset
-    printr(
+    logger.info(
         f'\nTotal batch size = {config.data.batch_size * dist.get_world_size() * config.train.num_batches_per_step}')
     if config.data.dali:
         dataset = DaliImageNet(config.data.dataset_path,
@@ -138,7 +143,7 @@ def main():
     # Resume from checkpoint
     last_epoch, best_metric = -1, None
     if os.path.exists(latest_pth_path):
-        printr(f'\n[resume_path] = {latest_pth_path}')
+        logger.info(f'\n[resume_path] = {latest_pth_path}')
         checkpoint = torch.load(latest_pth_path)
         if 'model' in checkpoint:
             model.load_state_dict(checkpoint.pop('model'))
@@ -148,14 +153,14 @@ def main():
         best_metric = checkpoint.get('meters', {}).get(
             f'{METRIC}_best', best_metric)
     else:
-        printr('\n==> train from scratch')
+        logger.info('\n==> train from scratch')
 
     # Training
     training_meters = make_meters()
     meters = evaluate(model, meters=training_meters,
                       loader=loaders['test'], split='test', dali=config.data.dali)
     for k, meter in meters.items():
-        printr(f'[{k}] = {meter:.2f}')
+        logger.info(f'[{k}] = {meter:.2f}')
     if args.evaluate or last_epoch >= config.train.num_epochs:
         return
 
@@ -168,7 +173,7 @@ def main():
         writer = None
 
     for current_epoch in range(last_epoch + 1, config.train.num_epochs):
-        printr(
+        logger.info(
             f'\n==> training epoch {current_epoch + 1}/{config.train.num_epochs}')
 
         train(model=model, loader=loaders['train'],
@@ -190,9 +195,9 @@ def main():
             best_metric, best = meters[METRIC], True
         meters[f'{METRIC}_best'] = best_metric
 
-        printr('')
+        logger.info('')
         for k, meter in meters.items():
-            printr(f'[{k}] = {meter:.2f}')
+            logger.info(f'[{k}] = {meter:.2f}')
             if writer is not None:
                 writer.add_scalar(k, meter, current_epoch)
                 lr = optimizer.param_groups[0]['lr']
@@ -217,7 +222,7 @@ def main():
                 os.remove(
                     checkpoint_path_fmt.format(epoch=current_epoch - 3)
                 )
-            printr(f'[save_path] = {checkpoint_path}')
+            logger.info(f'[save_path] = {checkpoint_path}')
 
 
 def train(model,
@@ -316,11 +321,6 @@ def evaluate(model, loader, meters, split='test', show_progress=False, dali=Fals
         meter.set(data)
         meters[k] = meter.compute()
     return meters
-
-
-def printr(*args, **kwargs):
-    if dist.get_rank() == 0:
-        print(*args, **kwargs)
 
 
 if __name__ == '__main__':
