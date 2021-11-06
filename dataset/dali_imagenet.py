@@ -1,3 +1,4 @@
+from torch.cuda import device
 from nvidia.dali.pipeline import Pipeline
 from nvidia.dali.plugin.pytorch import DALIClassificationIterator, LastBatchPolicy
 import nvidia.dali.fn as fn
@@ -41,34 +42,19 @@ class DaliDataloader(DALIClassificationIterator):
                     'image/encoded': tfrec.FixedLenFeature((), tfrec.string, ""),
                     'image/class/label': tfrec.FixedLenFeature([1], tfrec.int64, -1),
                 })
-            jpegs = inputs["image/encoded"]
+            images = inputs["image/encoded"]
 
             if training:
-                # decode jpeg and random crop
-                images = fn.decoders.image_random_crop(jpegs,
-                                                       device='mixed' if gpu_aug else 'cpu',
-                                                       output_type=types.RGB,
-                                                       random_aspect_ratio=[
-                                                           crop / resize, resize / crop],
-                                                       random_area=[
-                                                           crop / resize, 1.0],
-                                                       num_attempts=100
-                                                       )
-                images = fn.resize(images,
-                                   device='gpu' if gpu_aug else 'cpu',
-                                   resize_x=resize,
-                                   resize_y=resize,
-                                   dtype=types.FLOAT,
-                                   interp_type=types.INTERP_TRIANGULAR)
+                images = fn.decoders.image(images,
+                                           device='mixed' if gpu_aug else 'cpu',
+                                           output_type=types.RGB)
+                images = fn.random_resized_crop(images,
+                                                size=crop,
+                                                device='gpu' if gpu_aug else 'cpu')
                 flip_lr = fn.random.coin_flip(probability=0.5)
-
-                # additional training transforms
-                images = fn.rotate(images, angle=fn.random.uniform(range=(-30, 30)),
-                                   keep_size=True, fill_value=0)
-                # ... https://docs.nvidia.com/deeplearning/dali/user-guide/docs/supported_ops.html
             else:
                 # decode jpeg and resize
-                images = fn.decoders.image(jpegs,
+                images = fn.decoders.image(images,
                                            device='mixed' if gpu_aug else 'cpu',
                                            output_type=types.RGB)
                 images = fn.resize(images,
@@ -83,10 +69,8 @@ class DaliDataloader(DALIClassificationIterator):
             images = fn.crop_mirror_normalize(images,
                                               dtype=types.FLOAT,
                                               crop=(crop, crop),
-                                              mean=[0.485 * 255, 0.456 *
-                                                    255, 0.406 * 255],
-                                              std=[0.229 * 255, 0.224 *
-                                                   255, 0.225 * 255],
+                                              mean=[127.5],
+                                              std=[127.5],
                                               mirror=flip_lr)
             label = inputs["image/class/label"] - 1  # 0-999
             # LSG: element_extract will raise exception, let's flatten outside
