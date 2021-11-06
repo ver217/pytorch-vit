@@ -104,8 +104,8 @@ class DaliDataloader(DALIClassificationIterator):
 
     def __iter__(self):
         # if not reset (after an epoch), reset; if just initialize, ignore
-        # if self._counter >= self._size or self._size < 0:
-        #     self.reset()
+        if self._counter >= self._size or self._size < 0:
+            self.reset()
         return self
 
     def __next__(self):
