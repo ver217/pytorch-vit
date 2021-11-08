@@ -2,6 +2,7 @@ from utils import Config
 from timm.models import vit_small_patch16_224
 from optim import lr_scheduler
 from torch import optim
+from loss import MulticlassBCEWithLogitsLoss
 
 __all__ = ['config']
 
@@ -39,5 +40,9 @@ config = Config({
         'type': vit_small_patch16_224,
         'drop_rate': 0.1,
         'weight_init': 'jax',
-    }
+    },
+    'criterion': {
+        'type': MulticlassBCEWithLogitsLoss,
+        'smoothing': 0.1,
+    },
 })

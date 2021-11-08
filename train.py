@@ -9,7 +9,6 @@ from config import config
 import numpy as np
 import torch.distributed as dist
 import torch
-import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import torch.multiprocessing as mp
 from tqdm import tqdm
@@ -116,7 +115,8 @@ def main():
     model = DDP(model, device_ids=[dist.get_rank()])
 
     # Build loss function
-    criterion = nn.CrossEntropyLoss()
+    criterion = config.criterion.pop('type')
+    criterion = criterion(**config.criterion)
 
     # Build optimizer
     optimizer = config.optimizer.pop('type')
