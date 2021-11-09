@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset import ImageNetFolder, make_meters, DaliImageNet
 from torch.cuda import amp
 from logger import DistributedLogger
+from loss import mixup
 
 METRIC = 'acc/test_top1'
 
@@ -80,7 +81,8 @@ def main():
                                batch_size=config.data.batch_size,
                                shard_id=dist.get_rank(),
                                num_shards=dist.get_world_size(),
-                               gpu_aug=config.data.gpu_aug)
+                               gpu_aug=config.data.gpu_aug,
+                               mixup_alpha=config.data.mixup_alpha)
     else:
         dataset = ImageNetFolder(config.data.dataset_path)
         loader_kwargs = {'num_workers': config.data.num_workers,

@@ -1,4 +1,3 @@
-from torch.cuda import device
 from nvidia.dali.pipeline import Pipeline
 from nvidia.dali.plugin.pytorch import DALIClassificationIterator, LastBatchPolicy
 import nvidia.dali.fn as fn
@@ -7,6 +6,7 @@ import nvidia.dali.tfrecord as tfrec
 import os
 import glob
 import torch
+import numpy as np
 
 
 class DaliDataloader(DALIClassificationIterator):
@@ -22,7 +22,10 @@ class DaliDataloader(DALIClassificationIterator):
                  prefetch=2,
                  training=True,
                  gpu_aug=False,
-                 cuda=True):
+                 cuda=True,
+                 mixup_alpha=0.0):
+        self.mixup_alpha = mixup_alpha
+        self.training = training
         pipe = Pipeline(batch_size=batch_size,
                         num_threads=num_threads,
                         device_id=torch.cuda.current_device() if cuda else None,
@@ -96,6 +99,12 @@ class DaliDataloader(DALIClassificationIterator):
         data = super().__next__()
         img, label = data[0]['data'], data[0]['label']
         label = label.squeeze()
+        if self.training and self.mixup_alpha > 0.0:
+            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+            idx = torch.randperm(img.size(0)).to(img.device)
+            img = lam * img + (1 - lam) * img[idx, :]
+            label_a, label_b = label, label[idx]
+            label = (label_a, label_b, lam)
         return img, label
 
 
@@ -104,7 +113,8 @@ class DaliImageNet(dict):
                  shard_id=0, num_shards=1,
                  batch_size=128, num_threads=4,
                  prefetch=2,
-                 gpu_aug=True):
+                 gpu_aug=True,
+                 mixup_alpha=0.0):
         train_pat = os.path.join(root, 'train/*')
         train_idx_pat = os.path.join(root, 'idx_files/train/*')
         train = DaliDataloader(sorted(glob.glob(train_pat)),
@@ -116,7 +126,8 @@ class DaliImageNet(dict):
                                prefetch=prefetch,
                                training=True,
                                cuda=True,
-                               gpu_aug=gpu_aug)
+                               gpu_aug=gpu_aug,
+                               mixup_alpha=mixup_alpha)
         test_pat = os.path.join(root, 'validation/*')
         test_idx_pat = os.path.join(root, 'idx_files/validation/*')
         test = DaliDataloader(sorted(glob.glob(test_pat)),
@@ -128,5 +139,6 @@ class DaliImageNet(dict):
                               prefetch=prefetch,
                               training=False,
                               cuda=True,
-                              gpu_aug=gpu_aug)
+                              gpu_aug=gpu_aug,
+                              mixup_alpha=mixup_alpha)
         super().__init__(train=train, test=test)
