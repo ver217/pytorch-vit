@@ -16,7 +16,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset import ImageNetFolder, make_meters, DaliImageNet
 from torch.cuda import amp
 from logger import DistributedLogger
-from loss import mixup
 
 METRIC = 'acc/test_top1'
 
@@ -128,19 +127,14 @@ def main():
     if config.train.amp:
         scaler = amp.GradScaler()
 
-    # num_steps_per_epoch = len(loaders['train']) // args.num_batches_per_step
-    # warmup_lr_epochs = getattr(args, 'warmup_epochs', 0)
-    # warmup_lr_epochs = int(warmup_lr_epochs)
-    # last = max((last_epoch - warmup_lr_epochs + 1)
-    #            * num_steps_per_epoch - 2, -1)
-    # decay_steps = args.num_epochs * num_steps_per_epoch
-    # warmup_steps = warmup_lr_epochs
-    # if warmup_lr_epochs > 0:
-    #     warmup_steps *= num_steps_per_epoch
     # Build lr scheduler
-    scheduler = config.lr_scheduler.pop('type')
-    scheduler = scheduler(
-        optimizer, config.train.num_epochs, **config.lr_scheduler)
+    total_steps = config.train.num_epochs
+    if not config.train.schedule_lr_per_epoch:
+        num_steps_per_epoch = len(
+            loaders['train']) // config.train.num_batches_per_step
+        total_steps *= num_steps_per_epoch
+    lr_scheduler = config.lr_scheduler.pop('type')
+    lr_scheduler = lr_scheduler(optimizer, total_steps, **config.lr_scheduler)
 
     # Resume from checkpoint
     last_epoch, best_metric = -1, None
@@ -184,7 +178,9 @@ def main():
               optimizer=optimizer,
               num_batches_per_step=config.train.num_batches_per_step,
               writer=writer, show_progress=dist.get_rank() == 0, dali=config.data.dali,
-              use_amp=config.train.amp, scaler=scaler, clip_grad=config.train.clip_grad)
+              use_amp=config.train.amp, scaler=scaler, clip_grad=config.train.clip_grad,
+              schedule_lr_per_epoch=config.train.schedule_lr_per_epoch,
+              lr_scheduler=lr_scheduler)
         meters = dict()
         for split, loader in loaders.items():
             if split != 'train':
@@ -202,10 +198,10 @@ def main():
             logger.info(f'[{k}] = {meter:.2f}')
             if writer is not None:
                 writer.add_scalar(k, meter, current_epoch)
-                lr = optimizer.param_groups[0]['lr']
-                writer.add_scalar('lr/train', lr, current_epoch)
+                if config.train.schedule_lr_per_epoch:
+                    lr = optimizer.param_groups[0]['lr']
+                    writer.add_scalar('lr/train', lr, current_epoch)
 
-        scheduler.step()
         checkpoint = {
             'epoch': current_epoch,
             'model': model.state_dict(),
@@ -239,7 +235,9 @@ def train(model,
           dali=False,
           use_amp=False,
           scaler=None,
-          clip_grad=0.0):
+          clip_grad=0.0,
+          schedule_lr_per_epoch=True,
+          lr_scheduler=None):
     if sampler:
         sampler.set_epoch(epoch)
     model.train()
@@ -287,6 +285,13 @@ def train(model,
             if writer is not None:
                 global_step = step + epoch * num_steps_per_epoch
                 writer.add_scalar('loss/train', loss, global_step)
+                if not schedule_lr_per_epoch:
+                    lr = optimizer.param_groups[0]['lr']
+                    writer.add_scalar('lr/train', lr, global_step)
+            if not schedule_lr_per_epoch:
+                lr_scheduler.step()
+    if schedule_lr_per_epoch:
+        lr_scheduler.step()
     try:
         while True:
             next(train_iter)

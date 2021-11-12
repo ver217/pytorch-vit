@@ -53,12 +53,12 @@ class LAMB(Optimizer):
         if closure is not None:
             loss = closure()
 
-        torch.nn.utils.clip_grad_norm_(
-            parameters=[
-                p for group in self.param_groups for p in group['params']],
-            max_norm=1.0,
-            norm_type=2
-        )
+        # torch.nn.utils.clip_grad_norm_(
+        #     parameters=[
+        #         p for group in self.param_groups for p in group['params']],
+        #     max_norm=1.0,
+        #     norm_type=2
+        # )
 
         for group in self.param_groups:
             for p in group['params']:

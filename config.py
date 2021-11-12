@@ -19,6 +19,7 @@ config = Config({
         'use_tensorboard': True,
         'save_checkpoint': False,
         'amp': True,
+        'schedule_lr_per_epoch': True,
     },
     'data': {
         'dataset_path': '/mnt/shared/imagenet-100',
@@ -45,10 +46,6 @@ config = Config({
     },
     'criterion': {
         'type': MixupLoss,
-        'loss_fn': MulticlassBCEWithLogitsLoss(smoothing=0.1)
+        'loss_fn': MulticlassBCEWithLogitsLoss(smoothing=1e-4)
     },
-    # 'criterion': {
-    #     'type': MulticlassBCEWithLogitsLoss,
-    #     'smoothing': 0.1,
-    # },
 })
